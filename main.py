@@ -18,6 +18,7 @@ from astropy import coordinates
 from timeit import default_timer as timer
 import pprint
 import json
+from astroquery.astrometry_net import AstrometryNet
 
 
 def calc_sky_area(header):
@@ -29,45 +30,118 @@ def calc_px_scale(pixel_size_um, focal_length_mm):
 class MosaicMagic:
 
 
-    def __init__(self, astrometry_url):
+    def __init__(self, api_key, astrometry_url):
         self.as_url = astrometry_url
-        login_resp = requests.post(astrometry_url+"/api/login")
-        login_data = json.loads(login_resp.text)
+        self.ast = AstrometryNet()
+        self.ast.api_key = api_key
+
+        
+
+        #login_resp = requests.post(self.as_url+"/api/login")
+        #login_data = json.loads(login_resp.text)
 
         #set up astrometry instance
-        self.session_id = login_data["session"]
-        print("Got astrometry session id: " + self.session_id)
+        #self.session_id = login_data["session"]
+        #print("Got astrometry session id: " + self.session_id)
+
+    def upload_img(self, fits_paths: Path, img, arcsecperpx, scale_error=100):
+
+        headers = {'Content-type': 'multipart/form-data'} 
+        
+        solve_meta = {}
+        
+        #header["Content-Type"] = "multipart/form-data"
+        solve_meta["session"] = self.session_id
+        solve_meta["allow_commercial_use"] = "d"
+        solve_meta["allow_modifications"] = "d"
+        solve_meta["publicly_visible"] = "y"
+        solve_meta["scale_units"] = "arcsecperpix"
+        solve_meta["scale_type"] = "ev"
+        solve_meta["scale_est"] = arcsecperpx
+        solve_meta["scale_error"] = scale_error
+
+        header_json = json.dumps(solve_meta)
+        print(header_json)
+
+        
+        files = {'file': open(fits_paths, 'rb')}
+        print("uploading")
+        test = requests.get(self.as_url+"/api/upload/", data=solve_meta)
+
+        print(test.text)
 
 
-
-    def solve_image(self, img, force_solve=False):
+    def solve_image(self, fits_paths: Path, img, force_solve=False):
         print(img)
 
-    def process_single_image(self, fits_paths: Path):
-        print("Starting to process image at "  + str(fits_paths.absolute()))
-        hdul = astropy.io.fits.open(fits_paths.absolute())
-        hdul.info()
-        pprint.pprint(hdul[0].header)
-
-        px_scale = calc_px_scale(hdul[0].header['XPIXSZ'], hdul[0].header['FOCALLEN'] )
+        px_scale = calc_px_scale(img.header['XPIXSZ'], img.header['FOCALLEN'] )
         
         blind_solve = False
         ra = 0
         dec = 0
 
-        if hdul[0].header['RA'] is not None:
-            ra = hdul[0].header['RA']
+        if img.header['RA'] is not None:
+            ra = img.header['RA']
         else:
             blind_solve = True
 
-        if hdul[0].header['DEC'] is not None:
-            dec = hdul[0].header['DEC']
+        if img.header['DEC'] is not None:
+            dec = img.header['DEC']
         else:
             blind_solve = True
         
         print(f"Estimated pixel scale from fits headers is {px_scale}")
         if not blind_solve:
             print(f"Extracted following RA: {ra} and DEC: {dec}")
+
+        existing_wcs = WCS(img.header)
+        if not existing_wcs.has_celestial and not force_solve:
+            #self.upload_img(fits_paths, img, px_scale)
+            try_again = True
+            submission_id = None
+
+            while try_again:
+                try:
+                    if not submission_id:
+                        wcs_header = self.ast.solve_from_image(str(fits_paths),
+                                                        submission_id=submission_id,
+                                                        solve_timeout=1200)
+                    else:
+                        wcs_header = self.ast.monitor_submission(submission_id,
+                                                            solve_timeout=600)
+                except TimeoutError as e:
+                    submission_id = e.args[1]
+                else:
+                    # got a result, so terminate
+                    try_again = False
+
+            
+            w = WCS(wcs_header)
+            solved_w_header = w.to_fits(relax=True)
+            print(solved_w_header[0])
+            for header_key in solved_w_header[0].header:
+                print(f"Adding [{header_key}] = {solved_w_header[0].header[header_key]}")
+                if header_key in img.header:
+                    print("Print key already exists in dest file, skipping")
+                else:
+                    img.header[header_key] = solved_w_header[0].header[header_key]
+        else:
+            print("Already detected valid WCS header data in " + str(fits_paths.absolute()) + " - skipping solve!")
+
+        pprint.pprint(img.header)
+
+        return img
+
+    def process_single_image(self, fits_paths: Path):
+        print("Starting to process image at "  + str(fits_paths.absolute()))
+        hdul = astropy.io.fits.open(fits_paths.absolute(), mode='update')
+        pprint.pprint(hdul[0].header)
+
+        hdul[0] = self.solve_image(fits_paths, hdul[0])
+
+        hdul.flush()
+        hdul.close()
+    
 
 def main():
     ap = argparse.ArgumentParser()
@@ -78,6 +152,7 @@ def main():
     ap.add_argument("--swap_dir", help="Directory memory mapped ararys will be saved during stacking. "
                                        "A fast SSD with lots of space will increase speed, however having enough space is more important",
                     default="mosaic_swap")
+    ap.add_argument("--astrometry_api_key")
 
     args = ap.parse_args()
 
@@ -106,7 +181,7 @@ def main():
 
     base_url = "http://127.0.0.1:"+str(args.astrometry_port)
 
-    mm = MosaicMagic(base_url)
+    mm = MosaicMagic(args.astrometry_api_key, base_url)
     
 
     solve_pool = ProcessPoolExecutor()
