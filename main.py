@@ -70,6 +70,27 @@ class MosaicMagic:
 
         print(test.text)
 
+    def astrometry_upload(self, fits_paths: Path, force_upload=False):
+        try_again = True
+        submission_id = None
+
+        while try_again:
+            try:
+                if not submission_id:
+                    wcs_header = self.ast.solve_from_image(str(fits_paths),
+                                                    submission_id=submission_id,
+                                                    solve_timeout=2000, force_image_upload=force_upload)
+                else:
+                    wcs_header = self.ast.monitor_submission(submission_id,
+                                                        solve_timeout=2000)
+            except TimeoutError as e:
+                submission_id = e.args[1]
+                print("lol it failed")
+            else:
+                # got a result, so terminate
+                try_again = False
+
+        return wcs_header
 
     def solve_image(self, fits_paths: Path, img, force_solve=False):
         print(img)
@@ -97,24 +118,13 @@ class MosaicMagic:
         existing_wcs = WCS(img.header)
         if not existing_wcs.has_celestial and not force_solve:
             #self.upload_img(fits_paths, img, px_scale)
-            try_again = True
-            submission_id = None
 
-            while try_again:
-                try:
-                    if not submission_id:
-                        wcs_header = self.ast.solve_from_image(str(fits_paths),
-                                                        submission_id=submission_id,
-                                                        solve_timeout=1200)
-                    else:
-                        wcs_header = self.ast.monitor_submission(submission_id,
-                                                            solve_timeout=600)
-                except TimeoutError as e:
-                    submission_id = e.args[1]
-                else:
-                    # got a result, so terminate
-                    try_again = False
 
+            try:
+                wcs_header = self.astrometry_upload(fits_paths)
+            except:
+                print("Got an exception, retrying with img upload")
+                wcs_header = self.astrometry_upload(fits_paths, force_upload=True)
             
             w = WCS(wcs_header)
             solved_w_header = w.to_fits(relax=True)
@@ -128,7 +138,7 @@ class MosaicMagic:
         else:
             print("Already detected valid WCS header data in " + str(fits_paths.absolute()) + " - skipping solve!")
 
-        pprint.pprint(img.header)
+        #pprint.pprint(img.header)
 
         return img
 
@@ -136,12 +146,16 @@ class MosaicMagic:
         print("Starting to process image at "  + str(fits_paths.absolute()))
         hdul = astropy.io.fits.open(fits_paths.absolute(), mode='update')
         pprint.pprint(hdul[0].header)
-
+        
+        
         hdul[0] = self.solve_image(fits_paths, hdul[0])
+
+        processed_header = hdul[0].header
 
         hdul.flush()
         hdul.close()
-    
+
+        return WCS(processed_header).has_celestial
 
 def main():
     ap = argparse.ArgumentParser()
@@ -185,15 +199,21 @@ def main():
     
 
     solve_pool = ProcessPoolExecutor()
+    results = []
     #processing_futures = []
-    #for fits in fits_for_processing:
+    for fits in fits_for_processing:
     #    processing_futures.append(solve_pool.submit(process_single_image, fits))
+        
+        has_celestial_wcs = mm.process_single_image(fits)
+        results.append((has_celestial_wcs, fits))
     
-    mm.process_single_image(fits_for_processing[0])
+    #mm.process_single_image(fits_for_processing[0])
 
     print("Starting to wait")
     #concurrent.futures.wait(processing_futures)
     print("All platesolving done")
+
+    pprint.pprint(results)
 
 
 
